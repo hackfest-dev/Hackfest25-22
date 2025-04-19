@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, WebSocket, HTTPException
+from fastapi import FastAPI, WebSocket, HTTPException, File, Form, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 import cv2
 import numpy as np
@@ -11,6 +11,17 @@ from pydantic import BaseModel
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from depth import get_depth
+import mediapipe as mp
+from typing import List
+from orb import router as orb_router
+from orb import match_descriptors
+import pickle
+from pathlib import Path
+
+# Initialize MediaPipe Face Mesh
+mp_face_mesh = mp.solutions.face_mesh
+face_mesh = mp_face_mesh.FaceMesh(min_detection_confidence=0.5, min_tracking_confidence=0.5)
+orb = cv2.ORB_create(nfeatures=1000)
 
 class TranslationRequest(BaseModel):
     text: str
@@ -33,12 +44,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(orb_router, prefix="/orb", tags=["orb"])
+
 MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolov8n.pt")
 print(f"Loading YOLO model from {MODEL_PATH}")
 model = YOLO(MODEL_PATH)
 print("Model loaded successfully")
 
 depth_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="depth")
+
+def load_stored_descriptors():
+    """Load all stored descriptors from pkl files"""
+    descriptor_dir = Path("descriptors")
+    stored_descriptors = {}
+    
+    if descriptor_dir.exists():
+        for pkl_file in descriptor_dir.glob("*.pkl"):
+            try:
+                with open(pkl_file, 'rb') as f:
+                    data = pickle.load(f)
+                    stored_descriptors[data['person_name']] = data
+                print(f"✅ Loaded descriptors for {data['person_name']}")
+            except Exception as e:
+                print(f"❌ Error loading {pkl_file.name}: {e}")
+    
+    return stored_descriptors
 
 async def process_frame_detection(frame, target_lang="en"):
     if frame is None:
@@ -49,23 +79,55 @@ async def process_frame_detection(frame, target_lang="en"):
         detected_objects = []
         boxes_info = []
         
+        # Load stored descriptors
+        saved_descriptors = load_stored_descriptors()
+        
+        # Process faces
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        face_results = face_mesh.process(frame_rgb)
+        
+        # Improved box processing with error handling
         for box in results.boxes:
-            class_id = int(box.cls)
-            class_name = model.names[class_id]
-            coords = [int(x) for x in box.xyxy[0].tolist()]
+            try:
+                class_id = int(box.cls)
+                class_name = model.names[class_id]
+                
+                coords = [int(x) for x in box.xyxy[0].tolist()]
+                h, w, _ = frame.shape
+                x1, y1, x2, y2 = max(0, coords[0]), max(0, coords[1]), min(w, coords[2]), min(h, coords[3])
+                
+                if class_name == "person":
+                    person_crop = frame[y1:y2, x1:x2]
+                    if person_crop.size > 0:
+                        gray = cv2.cvtColor(person_crop, cv2.COLOR_BGR2GRAY)
+                        keypoints, current_descriptors = orb.detectAndCompute(gray, None)
+                        
+                        if current_descriptors is not None and len(current_descriptors) > 0:
+                            # Ensure descriptors are uint8
+                            current_descriptors = np.array(current_descriptors, dtype=np.uint8)
+                            if len(current_descriptors.shape) == 1:
+                                current_descriptors = current_descriptors.reshape(-1, 32)
+                            
+                            person_name, match_count = match_descriptors(
+                                current_descriptors, 
+                                saved_descriptors,
+                                min_matches=10
+                            )
+                            
+                            if person_name:
+                                print(f"👤 {person_name} detected with {match_count} matches!")
+                                class_name = person_name
+                            else:
+                                print("⚠️ No face match found")
+                
+                translated_name = translate_text(class_name, target_lang)
+                box_info = {"label": translated_name, "box": [x1, y1, x2, y2]}
+                detected_objects.append(translated_name)
+                boxes_info.append(box_info)
             
-            translated_name = translate_text(class_name, target_lang)
-            
-            box_info = {
-                "label": translated_name,
-                "box": coords
-            }
-            
-            detected_objects.append(translated_name)
-            boxes_info.append(box_info)
-            
-            print(f"\nDetection:")
-            print(f"{{\n  \"label\": \"{translated_name}\",\n  \"box\": {coords}\n}}")
+            except Exception as single_box_error:
+                print(f"❌ Error processing box: {single_box_error}")
+                continue
             
         detection_text = ", ".join(set(detected_objects)) if detected_objects else "No objects detected"
         if not detected_objects:
@@ -93,6 +155,56 @@ async def process_frame_depth(frame):
     except Exception as e:
         print(f"❌ Depth error: {str(e)}")
         return None
+
+def match_descriptors(frame_descriptors, saved_descriptors, min_matches=10):
+    if not saved_descriptors:
+        print("\n⚠️ No saved descriptors found")
+        return None, 0
+    
+    best_match = None
+    max_matches = 0
+    
+    # Ensure frame descriptors are uint8 and correct shape (Nx32)
+    frame_descriptors = np.array(frame_descriptors, dtype=np.uint8)
+    if frame_descriptors.shape[1] != 32:
+        print(f"⚠️ Invalid frame descriptor shape: {frame_descriptors.shape}")
+        return None, 0
+    
+    print(f"\n🔍 Frame descriptors: {frame_descriptors.shape}")
+    
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+    
+    for person_name, person_data in saved_descriptors.items():
+        try:
+            descriptors_list = person_data.get('descriptors', [])
+            
+            for descriptor in descriptors_list:
+                try:
+                    stored_descriptors = np.array(descriptor['descriptors'], dtype=np.uint8)
+                    
+                    # Skip if wrong shape
+                    if stored_descriptors.shape[1] != 32:
+                        print(f"⚠️ Invalid stored descriptor shape: {stored_descriptors.shape}")
+                        continue
+                    
+                    matches = bf.match(frame_descriptors, stored_descriptors)
+                    good_matches = [m for m in matches if m.distance < 50]
+                    num_matches = len(good_matches)
+                    
+                    if num_matches > max_matches and num_matches >= min_matches:
+                        max_matches = num_matches
+                        best_match = person_name
+                        print(f"✨ Match found: {person_name} with {num_matches} matches")
+                        
+                except Exception as e:
+                    print(f"❌ Error matching descriptors: {str(e)}")
+                    continue
+                    
+        except Exception as e:
+            print(f"❌ Error processing person: {str(e)}")
+            continue
+    
+    return best_match, max_matches
 
 @app.websocket("/ws/video")
 async def video_stream(websocket: WebSocket):
@@ -143,6 +255,68 @@ async def get_depth_value():
     if distance is None:
         return {"error": "Failed to capture depth"}
     return {"estimated_distance_cm": distance}
+
+@app.post("/orb/process-images")
+async def process_images(
+    name: str = Form(...),
+    images: List[UploadFile] = File(...)
+):
+    try:
+        # Create directory for person if it doesn't exist
+        person_dir = f"data/faces/{name}"
+        os.makedirs(person_dir, exist_ok=True)
+        
+        all_descriptors = []
+        processed_count = 0
+        
+        # Process each image
+        for idx, image in enumerate(images):
+            contents = await image.read()
+            nparr = np.frombuffer(contents, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            
+            if img is None:
+                print(f"Failed to decode image {idx}")
+                continue
+                
+            # Extract ORB descriptors
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            keypoints, desc = orb.detectAndCompute(gray, None)
+            
+            if desc is not None and desc.size > 0:
+                # Ensure consistent shape by padding if necessary
+                if len(desc) < 500:  # Pad if less than 500 keypoints
+                    padding = np.zeros((500 - len(desc), 32), dtype=np.uint8)
+                    desc = np.vstack((desc, padding))
+                else:
+                    desc = desc[:500]  # Take only first 500 keypoints
+                    
+                all_descriptors.append(desc)
+                processed_count += 1
+                
+            # Save image
+            cv2.imwrite(f"{person_dir}/image_{idx}.jpg", img)
+            
+        if processed_count > 0:
+            # Stack all descriptors into a single array
+            all_descriptors = np.stack(all_descriptors)
+            np.save(f"{person_dir}/descriptors.npy", all_descriptors)
+            
+            print(f"Saved descriptors shape: {all_descriptors.shape}")
+            return {
+                "status": "success", 
+                "message": f"Processed {processed_count} images for {name}",
+                "shape": all_descriptors.shape
+            }
+        else:
+            raise HTTPException(
+                status_code=400, 
+                detail="No valid descriptors could be extracted from the images"
+            )
+        
+    except Exception as e:
+        print(f"Processing error: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.on_event("shutdown")
 async def shutdown_event():

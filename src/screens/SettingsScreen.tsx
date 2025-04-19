@@ -6,18 +6,20 @@ import {
   TouchableOpacity,
   Animated,
   ScrollView,
+  Button,
+  Alert,
+  ActivityIndicator,
+  TextInput,
+  Image,
 } from "react-native";
 import { Ionicons } from "@expo/vector-icons";
-import {
-  useTranslation,
-  SUPPORTED_LANGUAGES,
-} from "../context/TranslationContext";
+import { useTranslation, SUPPORTED_LANGUAGES } from "../context/TranslationContext";
 import { useSpeech } from "../hooks/useSpeech";
 import { useScreenAnnounce } from "../hooks/useScreenAnnounce";
+import * as ImagePicker from "expo-image-picker";
 
 export default function SettingsScreen() {
-  const { targetLanguage, setTargetLanguage, translateText, isLoading } =
-    useTranslation();
+  const { targetLanguage, setTargetLanguage, translateText } = useTranslation();
   useScreenAnnounce("Settings");
   const speakText = useSpeech();
   const [isExpanded, setIsExpanded] = useState(false);
@@ -25,41 +27,16 @@ export default function SettingsScreen() {
   const [translatedTitle, setTranslatedTitle] = useState("Language Settings");
   const [translations, setTranslations] = useState<Record<string, string>>({});
   const [isTranslating, setIsTranslating] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
 
-  const uiStrings = {
-    settings: "Settings",
-  };
-  
-  type UIStringKeys = keyof typeof uiStrings;
-
-  useEffect(() => {
-    const translateUI = async () => {
-      if (targetLanguage === "en") {
-        setTranslations(uiStrings);
-        return;
-      }
-
-      setIsTranslating(true);
-      try {
-        const translated: Record<string, string> = {};
-        for (const key in uiStrings) {
-          translated[key] = await translateText(uiStrings[key as UIStringKeys]);
-        }
-        setTranslations(translated);
-      } catch (error) {
-        console.error("Translation error:", error);
-        setTranslations(uiStrings); // fallback
-      } finally {
-        setIsTranslating(false);
-      }
-    };
-
-    translateUI();
-  }, [targetLanguage]);
+  // Image capture states
+  const MAX_IMAGES = 15;
+  const [imageUris, setImageUris] = useState<{ uri: string }[]>([]);
+  const [personName, setPersonName] = useState('');
 
   useEffect(() => {
     const translateTitle = async () => {
-      const translated = await translateText("Language Settings");
+      const translated = await translateText('Language Settings');
       setTranslatedTitle(translated);
     };
     translateTitle();
@@ -76,11 +53,120 @@ export default function SettingsScreen() {
 
   const handleLanguageSelect = async (langCode: string) => {
     await setTargetLanguage(langCode);
-    const confirmationText =
-      langCode === "en"
-        ? "Language changed to English"
-        : "भाषा हिंदी में बदल दी गई है";
+    const confirmationText = langCode === 'en' ? 
+      'Language changed to English' : 
+      'भाषा हिंदी में बदल दी गई है';
     await speakText(confirmationText);
+  };
+
+  const captureImages = async () => {
+    if (!personName.trim()) {
+      Alert.alert('Missing Name', 'Please enter a name before capturing images.');
+      return;
+    }
+
+    const permission = await ImagePicker.requestCameraPermissionsAsync();
+    if (!permission.granted) {
+      Alert.alert('Permission required', 'Camera access is needed to take pictures.');
+      return;
+    }
+
+    try {
+      const capturedImages: { uri: string }[] = [];
+      let captured = 0;
+
+      while (captured < MAX_IMAGES) {
+        const result = await ImagePicker.launchCameraAsync({
+          quality: 0.7,
+        });
+
+        if (result.canceled || result.assets.length === 0) break;
+
+        const newUri = result.assets[0].uri;
+        capturedImages.push({ uri: newUri });
+        setImageUris(prev => [...prev, { uri: newUri }]);
+        captured++;
+
+        if (captured < MAX_IMAGES) {
+          Alert.alert(
+            'Image Captured',
+            `${captured} images captured. ${MAX_IMAGES - captured} remaining.`
+          );
+        }
+      }
+
+      Alert.alert('Capture Complete', `${captured} images captured successfully`);
+    } catch (error) {
+      console.error('Error capturing images:', error);
+      Alert.alert('Error', 'Failed to capture images. Please try again.');
+    }
+  };
+
+  const uploadImages = async () => {
+    if (imageUris.length === 0) {
+      Alert.alert('No Images', 'Please capture images first.');
+      return;
+    }
+
+    if (!personName.trim()) {
+      Alert.alert('Missing Name', 'Please enter a name before uploading.');
+      return;
+    }
+
+    setIsLoading(true);
+    try {
+      const formData = new FormData();
+      formData.append('name', personName.trim());
+      
+      imageUris.forEach((img, idx) => {
+        formData.append('images', {
+          uri: img.uri,
+          type: 'image/jpeg',
+          name: `${personName.trim()}_${idx}.jpg`,
+        } as any);
+      });
+
+      const SERVER_IP = process.env.SERVER_IP || '192.168.137.1';
+      const url = `http://${SERVER_IP}:8000/orb/process-images`;
+      
+      console.log('Uploading to:', url); // Debug log
+      
+      const orbResponse = await fetch(url, {
+        method: 'POST',
+        body: formData,
+        headers: {
+          'Accept': 'application/json',
+          'Content-Type': 'multipart/form-data',
+        },
+      });
+
+      if (!orbResponse.ok) {
+        const errorText = await orbResponse.text();
+        console.error('Server error:', {
+          status: orbResponse.status,
+          statusText: orbResponse.statusText,
+          body: errorText
+        });
+        throw new Error(`Server Error (${orbResponse.status}): ${errorText}`);
+      }
+
+      const result = await orbResponse.json();
+      console.log('Upload success:', result);
+
+      Alert.alert('Success', `Images processed and saved for ${personName}`);
+      setImageUris([]);
+      setPersonName('');
+
+    } catch (error: any) {
+      const errorMessage = error.message || 'Unknown error occurred';
+      console.error('Upload failed:', errorMessage);
+      Alert.alert(
+        'Upload Failed',
+        `Please check your connection and try again.\nError: ${errorMessage}`
+      );
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const maxHeight = animation.interpolate({
@@ -90,21 +176,17 @@ export default function SettingsScreen() {
 
   return (
     <ScrollView style={styles.container}>
-      <Text style={styles.title}>
-        {isTranslating ? "Translating..." : translations.settings}
-      </Text>
-
-      <TouchableOpacity
-        style={styles.header}
+      <TouchableOpacity 
+        style={styles.header} 
         onPress={toggleExpand}
         activeOpacity={0.7}
       >
         <Text style={styles.headerText}>
-          {isLoading ? "Loading..." : translatedTitle}
+          {isLoading ? 'Loading...' : translatedTitle}
         </Text>
-        <Ionicons
-          name={isExpanded ? "chevron-up" : "chevron-down"}
-          size={24}
+        <Ionicons 
+          name={isExpanded ? 'chevron-up' : 'chevron-down'} 
+          size={24} 
           color="#333"
         />
       </TouchableOpacity>
@@ -115,16 +197,14 @@ export default function SettingsScreen() {
             key={lang.code}
             style={[
               styles.languageItem,
-              targetLanguage === lang.code && styles.selectedLanguage,
+              targetLanguage === lang.code && styles.selectedLanguage
             ]}
             onPress={() => handleLanguageSelect(lang.code)}
           >
-            <Text
-              style={[
-                styles.languageText,
-                targetLanguage === lang.code && styles.selectedLanguageText,
-              ]}
-            >
+            <Text style={[
+              styles.languageText,
+              targetLanguage === lang.code && styles.selectedLanguageText
+            ]}>
               {lang.name}
             </Text>
             {targetLanguage === lang.code && (
@@ -133,61 +213,138 @@ export default function SettingsScreen() {
           </TouchableOpacity>
         ))}
       </Animated.View>
+
+      <View style={styles.imageSection}>
+        <Text style={styles.title}>Instant Recognition</Text>
+        
+        {isLoading ? (
+          <ActivityIndicator size="large" color="#0000ff" />
+        ) : (
+          <>
+            <TextInput
+              style={styles.input}
+              value={personName}
+              onChangeText={setPersonName}
+              placeholder="Enter person's name"
+              placeholderTextColor="#666"
+            />
+
+            <Button 
+              title="Capture Images"
+              onPress={captureImages}
+              disabled={!personName.trim() || imageUris.length >= MAX_IMAGES}
+            />
+
+            <View style={styles.spacing} />
+
+            {imageUris.length > 0 && (
+              <ScrollView 
+                horizontal 
+                style={styles.imageScroll}
+                contentContainerStyle={styles.imageContainer}
+              >
+                {imageUris.map((img, index) => (
+                  <View key={index} style={styles.imageWrapper}>
+                    <Image 
+                      source={{ uri: img.uri }} 
+                      style={styles.thumbnail}
+                    />
+                  </View>
+                ))}
+              </ScrollView>
+            )}
+
+            <View style={styles.spacing} />
+
+            <Button
+              title="Upload Images"
+              onPress={uploadImages}
+              disabled={imageUris.length === 0 || !personName.trim()}
+            />
+          </>
+        )}
+      </View>
     </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  title: {
-    fontSize: 30,
-    fontWeight: "bold",
-    margin: 16,
-  },
   container: {
     flex: 1,
-    backgroundColor: "#E6E6FA",
+    backgroundColor: '#f5f5f5',
   },
   header: {
-    backgroundColor: "#fff",
+    backgroundColor: '#fff',
     padding: 15,
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
     borderBottomWidth: 1,
-    borderBottomColor: "#eee",
-    marginLeft: 16,
-    marginRight: 16,
-    borderRadius: 20,
+    borderBottomColor: '#eee',
   },
   headerText: {
     fontSize: 18,
-    fontWeight: "600",
-    color: "#333",
+    fontWeight: '600',
+    color: '#333',
   },
   languageList: {
-    overflow: "hidden",
+    overflow: 'hidden',
   },
   languageItem: {
-    backgroundColor: "#fff",
+    backgroundColor: '#fff',
     padding: 15,
-    flexDirection: "row",
-    justifyContent: "space-between",
-    alignItems: "center",
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
     borderBottomWidth: 1,
-    borderBottomColor: "#eee",
-    borderRadius: 20,
-    marginTop: 2,
-    marginLeft: 16,
-    marginRight: 16,
+    borderBottomColor: '#eee',
   },
   selectedLanguage: {
-    backgroundColor: "#005FCC",
+    backgroundColor: '#005FCC',
   },
   languageText: {
     fontSize: 16,
-    color: "#333",
+    color: '#333',
   },
   selectedLanguageText: {
-    color: "#fff",
+    color: '#fff',
+  },
+  imageSection: {
+    padding: 20,
+    paddingBottom: 40,
+  },
+  title: {
+    fontSize: 24,
+    fontWeight: 'bold',
+    marginBottom: 20,
+    textAlign: 'center',
+  },
+  input: {
+    borderWidth: 1,
+    borderColor: '#ddd',
+    padding: 10,
+    marginBottom: 20,
+    borderRadius: 5,
+    fontSize: 16,
+  },
+  spacing: {
+    height: 20,
+  },
+  imageScroll: {
+    maxHeight: 120,
+  },
+  imageContainer: {
+    gap: 10,
+  },
+  imageWrapper: {
+    borderWidth: 1,
+    borderColor: '#ddd',
+    borderRadius: 5,
+    padding: 2,
+  },
+  thumbnail: {
+    width: 100,
+    height: 100,
+    borderRadius: 3,
   },
 });
